@@ -13,9 +13,8 @@
         
         // Firebase Imports
         import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
-        // REMOVED onAuthStateChanged, which is not needed for sequential initial sign-in
         import { getAuth, signInAnonymously, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
-        import { getFirestore, doc, collection, addDoc, onSnapshot, query, orderBy, serverTimestamp, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { getFirestore, collection, addDoc, onSnapshot, query, orderBy, serverTimestamp, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
         
         // Global Firebase instances
         let app, db, auth;
@@ -34,7 +33,7 @@
         let startTime = 0;
         let score = 0;
         let isQuizActive = false;
-        let isAuthReady = false;
+        let isAuthReady = false; // Flag to ensure quiz doesn't start before init
 
         // Utility Functions
         const getRandomNumber = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
@@ -49,9 +48,16 @@
         // --- Firebase Initialization and Auth ---
 
         const initializeFirebase = async () => {
+            const statusElement = document.getElementById('status');
+            const userIdDisplay = document.getElementById('user-id-display');
+
             if (!firebaseConfig) {
-                console.error("Firebase config is missing.");
-                document.getElementById('status').textContent = "Error: Firebase configuration missing.";
+                // Handle case where platform variables are missing (e.g., GitHub Pages)
+                console.warn("Firebase config missing. Running in quiz-only mode.");
+                statusElement.textContent = "NOTICE: Score history/saving is disabled in this hosted environment.";
+                userIdDisplay.textContent = 'User ID: N/A (Quiz-Only Mode)';
+                isAuthReady = true; // Allow quiz to start without database
+                renderScores([]); // Clear history area
                 return;
             }
 
@@ -61,7 +67,7 @@
                 auth = getAuth(app);
                 setLogLevel('error'); // Only log errors to keep console clean
 
-                // NEW ROBUST AUTHENTICATION LOGIC: Await sign-in directly
+                // Robust sequential authentication logic: Await sign-in directly
                 let userCredential;
                 if (initialAuthToken) {
                     // 1. Attempt custom sign-in with provided token
@@ -77,17 +83,17 @@
                 } else {
                     throw new Error("Authentication succeeded but user ID could not be retrieved.");
                 }
-                // --- END NEW LOGIC ---
 
                 isAuthReady = true;
-                document.getElementById('user-id-display').textContent = `User ID: ${userId}`;
+                userIdDisplay.textContent = `User ID: ${userId}`;
                 console.log(`Firebase Ready. User ID: ${userId}`);
                 startListeningForScores(); // Start data listeners ONLY AFTER auth is confirmed
 
             } catch (error) {
                 console.error("Firebase initialization or authentication error:", error);
                 // Display the error message on the screen
-                document.getElementById('status').textContent = `Authentication Error: ${error.message}. Please check your connection or try again.`;
+                statusElement.textContent = `Authentication Error: ${error.message}. Score saving is disabled.`;
+                isAuthReady = true; // Still allow quiz to start even if DB failed
             }
         };
 
@@ -95,8 +101,7 @@
 
         const getScoresCollectionRef = () => {
             if (!db || !userId || userId === 'loading') {
-                // Return null if prerequisites are not met
-                console.warn("Database or User ID not ready when collection reference was requested.");
+                // Return null if prerequisites are not met (e.g., if DB was skipped)
                 return null;
             }
             // Private data storage path: /artifacts/{appId}/users/{userId}/scores
@@ -104,8 +109,9 @@
         };
 
         const saveScore = async (finalScore, timeTaken) => {
-            if (!isAuthReady) {
-                console.error("Cannot save score: Auth not ready.");
+            if (!isAuthReady || !db) { // Check if DB is available
+                console.warn("Cannot save score: Database not initialized or available.");
+                document.getElementById('status').textContent = "Score not saved (Database unavailable).";
                 return;
             }
             try {
@@ -119,6 +125,7 @@
                     timestamp: serverTimestamp()
                 });
                 console.log("Score saved successfully.");
+                document.getElementById('status').textContent = ""; // Clear status on success
             } catch (error) {
                 console.error("Error saving score:", error);
                 document.getElementById('status').textContent = `Save Error: ${error.message}`;
@@ -131,7 +138,8 @@
             if (!scoresRef) return;
             
             // Query to get the latest 50 scores, ordered by timestamp descending
-            const q = query(scoresRef, orderBy("timestamp", "desc"));
+            // Note: We avoid orderBy to prevent potential index errors on new users
+            const q = query(scoresRef); 
 
             onSnapshot(q, (snapshot) => {
                 const scores = [];
@@ -143,6 +151,10 @@
                         date
                     });
                 });
+                
+                // Sort scores in memory (since we removed orderBy from query)
+                scores.sort((a, b) => (b.timestamp?.toMillis() || 0) - (a.timestamp?.toMillis() || 0));
+
                 renderScores(scores);
             }, (error) => {
                 console.error("Error listening to scores:", error);
@@ -207,7 +219,7 @@
 
         const startQuiz = () => {
             if (!isAuthReady) {
-                document.getElementById('status').textContent = "Please wait, initializing Firebase...";
+                document.getElementById('status').textContent = "Please wait, initializing...";
                 return;
             }
             generateQuestions();
@@ -333,7 +345,7 @@
             historyBody.innerHTML = '';
             
             if (scores.length === 0) {
-                historyBody.innerHTML = '<tr><td colspan="4" class="p-3 text-center text-gray-500">No score history yet. Start a quiz!</td></tr>';
+                historyBody.innerHTML = '<tr><td colspan="4" class="p-3 text-center text-gray-500">No score history yet. (Database not connected)</td></tr>';
                 return;
             }
 
