@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Math Tables Trainer (MCQ 1-20)</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script type="module">
+        // Firebase Setup: Mandatory variables provided by the Canvas environment
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+        
+        // Firebase Imports
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, collection, addDoc, onSnapshot, query, orderBy, serverTimestamp, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        
+        // Global Firebase instances
+        let app, db, auth;
+        let userId = 'loading';
+
+        // Configuration for the quiz
+        const START_TABLE = 1;
+        const END_TABLE = 20; 
+        const MAX_MULTIPLIER = 20; 
+        const NUM_QUESTIONS = 10;
+        const NUM_OPTIONS = 4; // We need 4 options (1 correct + 3 incorrect)
+
+        // Quiz State
+        let currentQuestion = 0;
+        let questions = [];
+        let startTime = 0;
+        let score = 0;
+        let isQuizActive = false;
+        let isAuthReady = false;
+
+        // Utility Functions
+        const getRandomNumber = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
+        const shuffleArray = (array) => {
+            for (let i = array.length - 1; i > 0; i--) {
+                const j = Math.floor(Math.random() * (i + 1));
+                [array[i], array[j]] = [array[j], array[i]];
+            }
+            return array;
+        };
+        
+        // --- Firebase Initialization and Auth ---
+
+        const initializeFirebase = async () => {
+            if (!firebaseConfig) {
+                console.error("Firebase config is missing.");
+                document.getElementById('status').textContent = "Error: Firebase configuration missing.";
+                return;
+            }
+
+            try {
+                app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+                setLogLevel('error'); // Only log errors to keep console clean
+
+                // Authentication process
+                onAuthStateChanged(auth, async (user) => {
+                    if (user) {
+                        userId = user.uid;
+                    } else {
+                        // Sign in using custom token or anonymously
+                        if (initialAuthToken) {
+                            await signInWithCustomToken(auth, initialAuthToken);
+                            userId = auth.currentUser.uid;
+                        } else {
+                            await signInAnonymously(auth);
+                            userId = auth.currentUser.uid;
+                        }
+                    }
+                    isAuthReady = true;
+                    document.getElementById('user-id-display').textContent = `User ID: ${userId}`;
+                    console.log(`Firebase Ready. User ID: ${userId}`);
+                    startListeningForScores();
+                });
+            } catch (error) {
+                console.error("Firebase initialization or authentication error:", error);
+                document.getElementById('status').textContent = `Authentication Error: ${error.message}`;
+            }
+        };
+
+        // --- Data Handling (Firestore) ---
+
+        const getScoresCollectionRef = () => {
+            if (!db || !userId) {
+                console.error("Database or User ID not ready.");
+                return null;
+            }
+            // Private data storage path: /artifacts/{appId}/users/{userId}/scores
+            return collection(db, `artifacts/${appId}/users/${userId}/scores`);
+        };
+
+        const saveScore = async (finalScore, timeTaken) => {
+            if (!isAuthReady) {
+                console.error("Cannot save score: Auth not ready.");
+                return;
+            }
+            try {
+                const scoresRef = getScoresCollectionRef();
+                if (!scoresRef) return;
+
+                await addDoc(scoresRef, {
+                    score: finalScore,
+                    total: NUM_QUESTIONS,
+                    time: timeTaken,
+                    timestamp: serverTimestamp()
+                });
+                console.log("Score saved successfully.");
+            } catch (error) {
+                console.error("Error saving score:", error);
+                document.getElementById('status').textContent = `Save Error: ${error.message}`;
+            }
+        };
+
+        const startListeningForScores = () => {
+            if (!db || !userId) return;
+            const scoresRef = getScoresCollectionRef();
+            if (!scoresRef) return;
+            
+            // Query to get the latest 50 scores, ordered by timestamp descending
+            const q = query(scoresRef, orderBy("timestamp", "desc"));
+
+            onSnapshot(q, (snapshot) => {
+                const scores = [];
+                snapshot.forEach((doc) => {
+                    const data = doc.data();
+                    const date = data.timestamp ? new Date(data.timestamp.toDate()).toLocaleString() : 'N/A';
+                    scores.push({
+                        ...data,
+                        date
+                    });
+                });
+                renderScores(scores);
+            }, (error) => {
+                console.error("Error listening to scores:", error);
+                document.getElementById('status').textContent = `Data Error: ${error.message}`;
+            });
+        };
+
+        // --- Quiz Logic ---
+
+        // Generates three unique, plausible wrong answers (distractors)
+        const generateOptions = (correctAnswer) => {
+            const options = new Set([correctAnswer]);
+            let attempts = 0;
+            
+            while (options.size < NUM_OPTIONS && attempts < 20) {
+                let distractor;
+                const type = getRandomNumber(1, 3);
+                
+                if (type === 1) {
+                    // Type 1: Small offset (e.g., +/- 1 to 5)
+                    distractor = correctAnswer + getRandomNumber(-5, 5);
+                } else if (type === 2) {
+                    // Type 2: Larger offset (e.g., +/- 10 to 20)
+                    distractor = correctAnswer + getRandomNumber(10, 20) * (Math.random() > 0.5 ? 1 : -1);
+                } else {
+                    // Type 3: Closeness (e.g., +/- 10% of answer)
+                    distractor = Math.round(correctAnswer * (1 + (Math.random() * 0.2 - 0.1)));
+                }
+
+                // Ensure distractor is positive and not equal to the correct answer or another option
+                if (distractor > 0 && !options.has(distractor)) {
+                    options.add(distractor);
+                }
+                attempts++;
+            }
+            
+            // If we still don't have enough options (unlikely), pad with random numbers
+            while (options.size < NUM_OPTIONS) {
+                options.add(getRandomNumber(1, 400));
+            }
+
+            return shuffleArray(Array.from(options));
+        };
+
+
+        const generateQuestions = () => {
+            questions = [];
+            for (let i = 0; i < NUM_QUESTIONS; i++) {
+                const tableNum = getRandomNumber(START_TABLE, END_TABLE);
+                const multiplier = getRandomNumber(START_TABLE, MAX_MULTIPLIER);
+                const correctAnswer = tableNum * multiplier;
+                
+                questions.push({
+                    table: tableNum,
+                    multiplier: multiplier,
+                    answer: correctAnswer,
+                    options: generateOptions(correctAnswer),
+                    correct: null // true, false, or null
+                });
+            }
+        };
+
+        const startQuiz = () => {
+            if (!isAuthReady) {
+                document.getElementById('status').textContent = "Please wait, initializing Firebase...";
+                return;
+            }
+            generateQuestions();
+            currentQuestion = 0;
+            score = 0;
+            startTime = Date.now();
+            isQuizActive = true;
+            document.getElementById('result-area').classList.add('hidden');
+            document.getElementById('quiz-container').classList.remove('hidden');
+            document.getElementById('start-button').classList.add('hidden');
+            document.getElementById('feedback').textContent = 'Pick the right answer!';
+            document.getElementById('feedback').className = 'font-bold text-gray-400';
+            renderQuestion();
+            renderProgress();
+        };
+
+        const renderQuestion = () => {
+            if (currentQuestion < NUM_QUESTIONS) {
+                const q = questions[currentQuestion];
+                document.getElementById('question-text').textContent = `${q.table} \u00D7 ${q.multiplier} = ?`;
+                document.getElementById('question-count').textContent = `Question ${currentQuestion + 1} of ${NUM_QUESTIONS}`;
+                
+                const optionsContainer = document.getElementById('options-container');
+                optionsContainer.innerHTML = ''; // Clear previous options
+                
+                q.options.forEach(option => {
+                    const button = document.createElement('button');
+                    button.textContent = option;
+                    button.dataset.answer = option;
+                    button.className = 'option-button w-full bg-blue-100 hover:bg-blue-200 text-blue-800 font-bold py-4 px-6 rounded-xl shadow-md transition duration-200 text-3xl sm:text-4xl active:scale-[0.98] border-2 border-blue-300';
+                    optionsContainer.appendChild(button);
+                });
+
+            }
+        };
+
+        const renderProgress = () => {
+            const progress = document.getElementById('progress-bar-fill');
+            const percentage = ((currentQuestion / NUM_QUESTIONS) * 100).toFixed(0);
+            progress.style.width = `${percentage}%`;
+        };
+
+        const checkAnswer = (userAnswer) => {
+            if (!isQuizActive) return;
+
+            const q = questions[currentQuestion];
+            const isCorrect = (parseInt(userAnswer, 10) === q.answer);
+            const buttonElement = document.querySelector(`[data-answer="${userAnswer}"]`);
+
+            // Visually highlight the selection
+            document.querySelectorAll('.option-button').forEach(btn => btn.disabled = true);
+            
+            if (isCorrect) {
+                score++;
+                questions[currentQuestion].correct = true;
+                buttonElement.classList.replace('bg-blue-100', 'bg-emerald-500');
+                buttonElement.classList.replace('text-blue-800', 'text-white');
+                showFeedback('Correct!', 'text-emerald-500');
+            } else {
+                questions[currentQuestion].correct = false;
+                buttonElement.classList.replace('bg-blue-100', 'bg-red-500');
+                buttonElement.classList.replace('text-blue-800', 'text-white');
+                
+                // Highlight the correct answer
+                const correctButton = document.querySelector(`[data-answer="${q.answer}"]`);
+                if(correctButton) {
+                   correctButton.classList.replace('bg-blue-100', 'bg-yellow-300');
+                   correctButton.classList.replace('text-blue-800', 'text-gray-900');
+                }
+                
+                showFeedback(`Wrong! Answer was ${q.answer}.`, 'text-red-500');
+            }
+
+            currentQuestion++;
+            
+            if (currentQuestion < NUM_QUESTIONS) {
+                setTimeout(() => {
+                    document.querySelectorAll('.option-button').forEach(btn => btn.disabled = false);
+                    renderQuestion();
+                    renderProgress();
+                    clearFeedback();
+                }, 1200); // Wait 1.2 seconds before next question
+            } else {
+                setTimeout(endQuiz, 1200);
+            }
+        };
+
+        const showFeedback = (message, colorClass) => {
+            const feedbackElement = document.getElementById('feedback');
+            feedbackElement.textContent = message;
+            feedbackElement.className = `font-bold transition-opacity duration-300 ${colorClass}`;
+        };
+
+        const clearFeedback = () => {
+             const feedbackElement = document.getElementById('feedback');
+             feedbackElement.textContent = 'Pick the right answer!';
+             feedbackElement.className = 'font-bold text-gray-400';
+        }
+
+        const endQuiz = () => {
+            isQuizActive = false;
+            const endTime = Date.now();
+            const timeTaken = ((endTime - startTime) / 1000).toFixed(1);
+
+            // Display results
+            document.getElementById('quiz-container').classList.add('hidden');
+            document.getElementById('result-area').classList.remove('hidden');
+            document.getElementById('final-score').textContent = `${score} / ${NUM_QUESTIONS}`;
+            document.getElementById('time-taken').textContent = `${timeTaken} seconds`;
+            document.getElementById('start-button').classList.remove('hidden');
+
+            // Save score to Firestore
+            saveScore(score, parseFloat(timeTaken));
+
+            // Render review table
+            renderReviewTable();
+        };
+
+        // --- Rendering ---
+
+        const renderScores = (scores) => {
+            const historyBody = document.getElementById('history-body');
+            historyBody.innerHTML = '';
+            
+            if (scores.length === 0) {
+                historyBody.innerHTML = '<tr><td colspan="4" class="p-3 text-center text-gray-500">No score history yet. Start a quiz!</td></tr>';
+                return;
+            }
+
+            scores.slice(0, 10).forEach((s) => {
+                const row = document.createElement('tr');
+                row.className = 'border-b last:border-b-0 hover:bg-gray-50 transition-colors';
+                row.innerHTML = `
+                    <td class="p-3 text-center font-semibold text-lg">${s.score}/${s.total}</td>
+                    <td class="p-3 text-center">${s.time}s</td>
+                    <td class="p-3 text-sm text-gray-500">${s.date}</td>
+                `;
+                historyBody.appendChild(row);
+            });
+        };
+
+        const renderReviewTable = () => {
+            const reviewBody = document.getElementById('review-body');
+            reviewBody.innerHTML = '';
+
+            questions.forEach((q, index) => {
+                const row = document.createElement('tr');
+                const bgColor = q.correct ? 'bg-emerald-50' : 'bg-red-50';
+                const textColor = q.correct ? 'text-emerald-800' : 'text-red-800';
+
+                row.className = `border-b last:border-b-0 ${bgColor}`;
+                row.innerHTML = `
+                    <td class="p-2 text-center">${index + 1}</td>
+                    <td class="p-2 text-center font-medium">${q.table} &times; ${q.multiplier}</td>
+                    <td class="p-2 text-center font-bold ${textColor}">${q.answer}</td>
+                `;
+                reviewBody.appendChild(row);
+            });
+        };
+
+        // --- Event Listeners and Initialization ---
+
+        window.onload = () => {
+            initializeFirebase();
+            
+            const startButton = document.getElementById('start-button');
+            const optionsContainer = document.getElementById('options-container');
+
+            startButton.addEventListener('click', startQuiz);
+            
+            // Event delegation for the multiple choice buttons
+            optionsContainer.addEventListener('click', (e) => {
+                if (e.target && e.target.classList.contains('option-button')) {
+                    const userAnswer = e.target.dataset.answer;
+                    checkAnswer(userAnswer);
+                }
+            });
+        };
+    </script>
+
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@100..900&display=swap');
+        * { font-family: 'Inter', sans-serif; }
+    </style>
+</head>
+<body class="bg-gray-50 min-h-screen p-4 sm:p-8 flex flex-col items-center">
+
+    <div class="w-full max-w-2xl bg-white shadow-xl rounded-2xl p-6 sm:p-10 border border-gray-100">
+        
+        <!-- Header -->
+        <header class="text-center mb-6">
+            <h1 class="text-4xl font-extrabold text-blue-700">Multiplication Trainer (MCQ)</h1>
+            <p class="text-lg text-gray-600 mt-1">Tables **1 through 20** (Multiple Choice).</p>
+            <p id="user-id-display" class="text-xs text-gray-400 mt-2">User ID: loading</p>
+            <p id="status" class="text-sm font-semibold text-orange-500 mt-1"></p>
+        </header>
+
+        <!-- Main Content Area -->
+        <div class="flex flex-col items-center">
+            
+            <!-- Start Button (Initial View & Post-Quiz) -->
+            <button id="start-button" 
+                class="w-full sm:w-1/2 bg-emerald-500 hover:bg-emerald-600 text-white font-bold py-3 px-6 rounded-xl shadow-lg transform transition duration-200 hover:scale-[1.02] active:scale-[0.98]">
+                Start Quiz (10 Questions)
+            </button>
+            
+            <!-- Quiz Container -->
+            <div id="quiz-container" class="hidden w-full">
+                
+                <!-- Progress Bar -->
+                <div class="mb-6">
+                    <div id="question-count" class="text-center text-sm font-medium text-blue-600 mb-1"></div>
+                    <div class="w-full bg-gray-200 rounded-full h-2.5">
+                        <div id="progress-bar-fill" class="bg-blue-500 h-2.5 rounded-full transition-all duration-500" style="width: 0%"></div>
+                    </div>
+                </div>
+
+                <!-- Question Area -->
+                <div class="text-center mb-6 bg-blue-50 p-6 rounded-xl shadow-inner">
+                    <p id="question-text" class="text-6xl font-extrabold text-blue-800 my-4">?</p>
+                </div>
+                
+                <!-- Multiple Choice Options -->
+                <div id="options-container" class="grid grid-cols-2 gap-4">
+                    <!-- Options buttons will be inserted here by JavaScript -->
+                </div>
+
+                <!-- Feedback Area -->
+                <div class="text-center mt-6 h-6">
+                     <p id="feedback" class="font-bold text-gray-400">Pick the right answer!</p>
+                </div>
+            </div>
+
+            <!-- Quiz Results Area -->
+            <div id="result-area" class="hidden w-full mt-4">
+                <div class="text-center mb-8 bg-gradient-to-r from-emerald-100 to-teal-100 p-8 rounded-2xl shadow-lg">
+                    <h2 class="text-3xl font-extrabold text-emerald-700 mb-2">Quiz Complete!</h2>
+                    <p class="text-xl text-gray-700">Your Score: <span id="final-score" class="font-bold text-emerald-900">0/10</span></p>
+                    <p class="text-xl text-gray-700">Time Taken: <span id="time-taken" class="font-bold text-emerald-900">0.0 seconds</span></p>
+                </div>
+
+                <!-- Review Table -->
+                <h3 class="text-2xl font-semibold text-gray-700 mb-4 border-b pb-2">Review Questions</h3>
+                <div class="overflow-x-auto rounded-xl border border-gray-200 shadow-sm mb-8">
+                    <table class="min-w-full divide-y divide-gray-200">
+                        <thead class="bg-gray-50">
+                            <tr>
+                                <th class="p-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider w-1/5">#</th>
+                                <th class="p-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider w-2/5">Question</th>
+                                <th class="p-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider w-2/5">Correct Answer</th>
+                            </tr>
+                        </thead>
+                        <tbody id="review-body" class="bg-white divide-y divide-gray-200">
+                            <!-- Review rows populated by JS -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Score History -->
+            <div class="w-full mt-8">
+                <h3 class="text-2xl font-semibold text-gray-700 mb-4 border-b pb-2">Score History (Last 10)</h3>
+                <div class="overflow-x-auto rounded-xl border border-gray-200 shadow-sm">
+                    <table class="min-w-full divide-y divide-gray-200">
+                        <thead class="bg-gray-50">
+                            <tr>
+                                <th class="p-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider w-1/4">Score</th>
+                                <th class="p-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider w-1/4">Time</th>
+                                <th class="p-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider w-1/2">Date/Time</th>
+                            </tr>
+                        </thead>
+                        <tbody id="history-body" class="bg-white divide-y divide-gray-200">
+                            <tr><td colspan="4" class="p-3 text-center text-gray-500">Loading scores...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+    </div>
+</body>
+</html>
