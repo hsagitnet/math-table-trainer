@@ -13,7 +13,8 @@
         
         // Firebase Imports
         import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
-        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        // REMOVED onAuthStateChanged, which is not needed for sequential initial sign-in
+        import { getAuth, signInAnonymously, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
         import { getFirestore, doc, collection, addDoc, onSnapshot, query, orderBy, serverTimestamp, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
         
         // Global Firebase instances
@@ -60,36 +61,42 @@
                 auth = getAuth(app);
                 setLogLevel('error'); // Only log errors to keep console clean
 
-                // Authentication process
-                onAuthStateChanged(auth, async (user) => {
-                    if (user) {
-                        userId = user.uid;
-                    } else {
-                        // Sign in using custom token or anonymously
-                        if (initialAuthToken) {
-                            await signInWithCustomToken(auth, initialAuthToken);
-                            userId = auth.currentUser.uid;
-                        } else {
-                            await signInAnonymously(auth);
-                            userId = auth.currentUser.uid;
-                        }
-                    }
-                    isAuthReady = true;
-                    document.getElementById('user-id-display').textContent = `User ID: ${userId}`;
-                    console.log(`Firebase Ready. User ID: ${userId}`);
-                    startListeningForScores();
-                });
+                // NEW ROBUST AUTHENTICATION LOGIC: Await sign-in directly
+                let userCredential;
+                if (initialAuthToken) {
+                    // 1. Attempt custom sign-in with provided token
+                    userCredential = await signInWithCustomToken(auth, initialAuthToken);
+                } else {
+                    // 2. Fallback to anonymous sign-in if token is missing
+                    userCredential = await signInAnonymously(auth);
+                }
+                
+                // 3. Set the userId based on the successful sign-in
+                if (userCredential && userCredential.user) {
+                    userId = userCredential.user.uid;
+                } else {
+                    throw new Error("Authentication succeeded but user ID could not be retrieved.");
+                }
+                // --- END NEW LOGIC ---
+
+                isAuthReady = true;
+                document.getElementById('user-id-display').textContent = `User ID: ${userId}`;
+                console.log(`Firebase Ready. User ID: ${userId}`);
+                startListeningForScores(); // Start data listeners ONLY AFTER auth is confirmed
+
             } catch (error) {
                 console.error("Firebase initialization or authentication error:", error);
-                document.getElementById('status').textContent = `Authentication Error: ${error.message}`;
+                // Display the error message on the screen
+                document.getElementById('status').textContent = `Authentication Error: ${error.message}. Please check your connection or try again.`;
             }
         };
 
         // --- Data Handling (Firestore) ---
 
         const getScoresCollectionRef = () => {
-            if (!db || !userId) {
-                console.error("Database or User ID not ready.");
+            if (!db || !userId || userId === 'loading') {
+                // Return null if prerequisites are not met
+                console.warn("Database or User ID not ready when collection reference was requested.");
                 return null;
             }
             // Private data storage path: /artifacts/{appId}/users/{userId}/scores
@@ -119,7 +126,7 @@
         };
 
         const startListeningForScores = () => {
-            if (!db || !userId) return;
+            if (!db || !userId || userId === 'loading') return;
             const scoresRef = getScoresCollectionRef();
             if (!scoresRef) return;
             
